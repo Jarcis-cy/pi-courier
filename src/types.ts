@@ -52,6 +52,12 @@ export interface ExternalMessage {
    * 只在 transport 的积压路径上置位;实时消息与「执行」后的再注入都不带。
    */
   replayed?: boolean;
+  /**
+   * 线程根(fork: MSC3440):消息发在某条 Matrix 线程里时的根事件 id。
+   * 缺省 = 时间线消息。threadSessions 开启时,router 以它(或群消息的
+   * messageId)作为车道键 —— 每根线程一个独立 pi 会话,回复也发回线程。
+   */
+  threadRoot?: string;
   /** 载荷(spec #72 票1/C3):文本、附件、附件失败或不支持类型,四选一 */
   payload: MessagePayload;
 }
@@ -121,6 +127,15 @@ export interface MsgBridgeConfig {
   multiProject?: boolean;
   /** pi 会话存储目录(对应 pi 的 --session-dir) */
   sessionDir?: string;
+  /**
+   * 线程会话(fork):true 时,群里每根 Matrix 线程成为一条独立车道 ——
+   * 懒起一个专属 pi 子进程(独立 --session-dir,重启可续),回复发回线程。
+   * 时间线上的群消息以自身为线程根开新车道;DM 不受影响。
+   * 缺省 false = 行为与上游逐字节一致。
+   */
+  threadSessions?: boolean;
+  /** 线程车道空闲回收阈值(分钟,默认 30;会话文件保留,复活即续)。 */
+  threadIdleMinutes?: number;
   /** 显式指定 pi 的 cli.js 路径(默认:PI_CLI_PATH → which pi → 本地 node_modules) */
   cliPath?: string;
   /** 日志级别:debug | info | warn | error(默认 info;`pi-courier logs --level debug` 可查看全量) */
@@ -350,6 +365,8 @@ export interface ReplyTarget {
   chatId: string;
   transport: string;
   username: string;
+  /** 线程根(fork):存在时该回合的回复都发进这条线程。 */
+  threadRoot?: string;
 }
 
 /**

@@ -244,8 +244,12 @@ export class MatrixProvider {
    * 发送一条文本消息,返回底层服务器分配的 event_id(issue #235 票1:返回值
    * 从「无」穿出为事件 ID 字符串,调用方——后续票的活卡状态机——凭它发起
    * 编辑)。空白文本仍是既有行为:不发送、早退返回空串(无事件可指)。
+   *
+   * fork: threadRoot 存在时,消息带 MSC3440 线程关系发进该线程 —— 客户端
+   * 把它收进对应线程视图,时间线只留 fallback。m.in_reply_to 同指根事件,
+   * 供不支持线程的客户端回退渲染。
    */
-  async sendMessage(chatId: string, text: string): Promise<string> {
+  async sendMessage(chatId: string, text: string, threadRoot?: string): Promise<string> {
     if (!this.client) {
       throw new Error("Matrix client not connected");
     }
@@ -262,6 +266,13 @@ export class MatrixProvider {
         ...(formattedBody && {
           format: "org.matrix.custom.html",
           formatted_body: formattedBody,
+        }),
+        ...(threadRoot && {
+          "m.relates_to": {
+            rel_type: "m.thread",
+            event_id: threadRoot,
+            "m.in_reply_to": { event_id: threadRoot },
+          },
         }),
       });
     });

@@ -358,6 +358,21 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     onRoomEvent: (_roomId, event, rpc) => {
       router.handleEvent(event, rpc);
     },
+    // fork: 线程车道(threadSessions 开启即启用)。每根线程一个专属 pi
+    // 子进程,会话目录按 room/root 分离 —— 重启/回收后 --continue 各自
+    // 续各自的。线程会话基目录:配置了 sessionDir 就放它下面的 threads/,
+    // 否则落在默认 workdir 的 .pi-threads/。
+    ...(config.threadSessions
+      ? {
+          threadOptions: {
+            cwd: workdir,
+            sessionBase: sessionDir
+              ? path.join(sessionDir, "threads")
+              : path.join(workdir, ".pi-threads"),
+            idleMinutes: config.threadIdleMinutes && config.threadIdleMinutes > 0 ? config.threadIdleMinutes : 30,
+          },
+        }
+      : {}),
     store,
     multiProject: store.get().multiProject === true,
     // 项目预设回执(issue #119):应用/失败各一行,发进项目房。sendReply
@@ -371,19 +386,20 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   // ---- message routing ------------------------------------------------------
   // 发送内核(票 #210 评审收尾):失败必须抛出 —— 上线欢迎卡靠它把失败
   // 带进 /pmctl new 的管理房回执附注;其余调用方一律经 sendReply 静默。
-  const sendReplyStrict = async (chatId: string, text: string): Promise<void> => {
+  // fork: threadRoot 可选穿透 —— 存在时消息带 MSC3440 线程关系发进线程。
+  const sendReplyStrict = async (chatId: string, text: string, threadRoot?: string): Promise<void> => {
     const provider = matrix;
     if (!provider) throw new Error("Transport matrix not found");
     if (!provider.isConnected) throw new Error("Transport matrix not connected");
-    await provider.sendMessage(chatId, text);
+    await provider.sendMessage(chatId, text, threadRoot);
   };
-  const sendReply = async (chatId: string, transport: string, text: string): Promise<void> => {
+  const sendReply = async (chatId: string, transport: string, text: string, threadRoot?: string): Promise<void> => {
     try {
       // transport 参数仅诊断显示(下方日志与错误文案拼贴),不参与 adapter
       // 查找 —— C8 退役注册表后,全文已无按 transport 名寻址的消费方
       // (grep 证实:仅剩字符串插值);签名保留以维持日志口径不变。
       // ExternalMessage.transport 字段本身是路由元数据,照旧携带。
-      await sendReplyStrict(chatId, text);
+      await sendReplyStrict(chatId, text, threadRoot);
       logger
         .withLabel(projectManager.labelForRoom(chatId))
         .debug(`📤 [${transport}] ${truncateLine(text, 500)}`);
@@ -597,14 +613,15 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     // 加密,无需特殊处理。
     ...(matrix
       ? {
-          sendLiveCard: (chatId: string, transport: string, text: string) => {
+          sendLiveCard: (chatId: string, transport: string, text: string, threadRoot?: string) => {
             void transport;
-            return matrix!.sendMessage(chatId, text);
+            return matrix!.sendMessage(chatId, text, threadRoot);
           },
-          editReply: async (chatId: string, transport: string, messageId: string, text: string) => {
+          editReply: async (chatId: string, transport: string, messageId: string, text: string, _threadRoot?: string) => {
             void transport;
             // editMessage 穿出的替换事件 event_id,router 侧无消费方:显式
-            // 吞掉保持 editReply 的 Promise<void> 契约。
+            // 吞掉保持 editReply 的 Promise<void> 契约。fork: 编辑指向的
+            // 卡片事件本身已在线程里,m.replace 继承线程归属,无需再带。
             await matrix!.editMessage(chatId, messageId, text);
           },
         }

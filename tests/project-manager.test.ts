@@ -229,3 +229,62 @@ describe("ProjectManager project presets (issue #119)", () => {
     expect(pm.projectFallbacks("!unmapped:s")).toBeUndefined();
   });
 });
+
+describe("fork: 线程车道(thread lanes)", () => {
+  function makeThreadPM(idleMinutes = 30) {
+    const made: Array<Record<string, unknown>> = [];
+    const defaultRpc = fakeRpc() as unknown as PiRpc;
+    const store = new ConfigStore({ managementRooms: [], workdir: "/w/main" });
+    const pm = new ProjectManager({
+      defaultRpc,
+      baseOptions: { args: ["--continue"] },
+      onRoomEvent: () => {},
+      multiProject: false,
+      store,
+      rpcFactory: ((opts: Record<string, unknown>) => {
+        const r = fakeRpc();
+        made.push(opts); // 记录 spawn 选项供断言
+        return r as unknown as PiRpc;
+      }) as unknown as NonNullable<ConstructorParameters<typeof ProjectManager>[0]["rpcFactory"]>,
+      threadOptions: { cwd: "/w/main", sessionBase: "/w/main/.pi-threads", idleMinutes },
+    });
+    return { pm, made, defaultRpc };
+  }
+
+  it("同一线程复用同一进程,不同线程各自懒起;会话目录按 root 分离", async () => {
+    const { pm, made } = makeThreadPM();
+    const a1 = await pm.getThreadRpc("!r:s", "$t1");
+    const a2 = await pm.getThreadRpc("!r:s", "$t1");
+    expect(a1).toBe(a2);
+    await pm.getThreadRpc("!r:s", "$t2");
+    expect(made.length).toBe(2);
+    // 独立 --session-dir,且带 --continue;baseOptions 原样穿透
+    const args = made[0]!.args as string[];
+    expect(args).toContain("--continue");
+    const idx = args.indexOf("--session-dir");
+    expect(args[idx + 1]).toMatch(/\.pi-threads/);
+    expect((made[0] as { cwd: string }).cwd).toBe("/w/main");
+    const dir1 = args[idx + 1] as string;
+    const dir2 = (made[1]!.args as string[])[args.indexOf("--session-dir") + 1] as string;
+    expect(dir1).not.toBe(dir2);
+  });
+
+  it("未启用线程(threadOptions 缺省)时 getThreadRpc 安全回落 getRpcForRoom", async () => {
+    const defaultRpc = fakeRpc() as unknown as PiRpc;
+    const store = new ConfigStore({ managementRooms: [], workdir: "/w" });
+    const pm = new ProjectManager({
+      defaultRpc,
+      baseOptions: {},
+      onRoomEvent: () => {},
+      store,
+    });
+    await expect(pm.getThreadRpc("!r:s", "$t")).resolves.toBe(defaultRpc);
+  });
+
+  it("stopAll 连线程车道一并回收", async () => {
+    const { pm, made } = makeThreadPM();
+    await pm.getThreadRpc("!r:s", "$t1");
+    await pm.stopAll();
+    expect(pm.threadLaneCount).toBe(0);
+  });
+});

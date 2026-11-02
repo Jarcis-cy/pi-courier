@@ -9,6 +9,7 @@
  * always go back to the right chat even with concurrent turns.
  */
 
+import { createHash } from "node:crypto";
 import * as path from "node:path";
 import type { RpcClient, RpcEventListener } from "@earendil-works/pi-coding-agent";
 import { type ConfigStore, projectFallbackChain } from "../config.js";
@@ -40,6 +41,18 @@ export interface ProjectManagerOptions {
   /** 项目房单行提示(issue #119:预设应用/失败回执)。组合根接线到
    *  sendReply;缺省 = 静默(测试与无传输部署)。 */
   notifyRoom?: (roomId: string, text: string) => void;
+  /**
+   * 线程车道(fork):提供即启用 —— 群里每根 Matrix 线程懒起一个专属
+   * pi 子进程。cwd = threadOptions.cwd;每车道独立 --session-dir
+   * (threadOptions.sessionBase 下按 room/root 分目录),重启可续;
+   * 空闲超过 idleMinutes 分钟自动回收(会话文件保留)。缺省 = 不启用,
+   * 行为与上游逐字节一致。
+   */
+  threadOptions?: {
+    cwd: string;
+    sessionBase: string;
+    idleMinutes: number;
+  };
 }
 
 /** 项目会话目录名(单一持有:pmctl 展示与 i18n 文案从这里取 —— 审计工程批 票19)。 */
@@ -55,6 +68,14 @@ export class ProjectManager {
   private notifyRoom: (roomId: string, text: string) => void;
   /** roomId -> PiRpc for project rooms (lazily started). */
   private projectRpcs = new Map<string, PiRpc>();
+  /** fork: 线程车道选项(undefined = 未启用)。 */
+  private threadOpts?: { cwd: string; sessionBase: string; idleMinutes: number };
+  /** fork: laneKey(`${roomId}::${threadRoot}`) -> PiRpc(懒起)。 */
+  private threadRpcs = new Map<string, PiRpc>();
+  /** fork: laneKey -> 最近活跃时间戳(ms,惰性写入)。 */
+  private threadLastUsed = new Map<string, number>();
+  /** fork: 空闲回收定时器(stopAll 清理)。 */
+  private threadReaper?: NodeJS.Timeout;
 
   constructor(opts: ProjectManagerOptions) {
     this.defaultRpc = opts.defaultRpc;
@@ -64,6 +85,11 @@ export class ProjectManager {
     this.store = opts.store;
     this.newRpc = opts.rpcFactory ?? ((options) => new PiRpc(options));
     this.notifyRoom = opts.notifyRoom ?? (() => {});
+    if (opts.threadOptions) {
+      this.threadOpts = opts.threadOptions;
+      this.threadReaper = setInterval(() => void this.reapIdleThreads(), 60_000);
+      this.threadReaper.unref?.();
+    }
   }
 
   /** Current projects mapping (roomId -> entry) — in-memory, no disk read. */
@@ -88,6 +114,68 @@ export class ProjectManager {
       return this.getProjectRpc(roomId, entry);
     }
     return this.defaultRpc;
+  }
+
+  // ── fork: 线程车道 ────────────────────────────────────────────────────
+  // 每根线程一个专属 pi 子进程:独立 --session-dir(会话持久,回收后复活
+  // 即续),cwd 与默认进程一致。未启用(threadOpts 缺省)时 getThreadRpc
+  // 永远不会被 router 调到;即便误调也安全回落默认进程。
+
+  /** 线程车道目录名:事件 id 含 `!$:` 等字符,清洗 + 短哈希防碰撞。 */
+  private threadDirName(rawId: string): string {
+    const sanitized = rawId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 48);
+    const hash = createHash("sha256").update(rawId).digest("hex").slice(0, 8);
+    return `${sanitized}-${hash}`;
+  }
+
+  /** 线程车道的 PiRpc(懒起;同车道并发消息复用同一 in-flight 连接)。 */
+  async getThreadRpc(roomId: string, threadRoot: string): Promise<PiRpc> {
+    if (!this.threadOpts) return this.getRpcForRoom(roomId);
+    const key = `${roomId}::${threadRoot}`;
+    this.threadLastUsed.set(key, Date.now());
+
+    const existing = this.threadRpcs.get(key);
+    if (existing) {
+      await existing.start().catch((err: unknown) => {
+        logger.withLabel(existing.label).warn(`⚠️ 线程 pi 进程连接失败(沿用现有实例继续): ${errorMessage(err)}`);
+      });
+      return existing;
+    }
+
+    const { cwd, sessionBase } = this.threadOpts;
+    const sessionDir = path.join(sessionBase, this.threadDirName(roomId), this.threadDirName(threadRoot));
+    const args = [...(this.baseOptions.args ?? []), "--session-dir", sessionDir];
+    const label = `thread/${this.threadDirName(threadRoot).slice(0, 20)}`;
+    const rpc = this.newRpc({ ...this.baseOptions, cwd, args, label });
+
+    rpc.onEvent((event) => {
+      this.onRoomEvent(roomId, event, rpc);
+    });
+
+    this.threadRpcs.set(key, rpc);
+    logger.withLabel(label).info(`🧵 线程 pi 进程启动: ${sessionDir}`);
+    await rpc.start();
+    return rpc;
+  }
+
+  /** 空闲回收:超时车道停进程、清记账;会话文件留在盘上,复活即续。 */
+  private async reapIdleThreads(): Promise<void> {
+    if (!this.threadOpts) return;
+    const idleMs = this.threadOpts.idleMinutes * 60_000;
+    const now = Date.now();
+    for (const [key, rpc] of this.threadRpcs) {
+      const last = this.threadLastUsed.get(key) ?? now;
+      if (now - last < idleMs) continue;
+      logger.withLabel(rpc.label).info(`🧵 线程车道空闲回收(会话已保留)`);
+      this.threadRpcs.delete(key);
+      this.threadLastUsed.delete(key);
+      await this.stopWithWarn(rpc);
+    }
+  }
+
+  /** 当前在跑的线程车道数(诊断口径,供 /status 类展示)。 */
+  get threadLaneCount(): number {
+    return this.threadRpcs.size;
   }
 
   /** The log label for a room's project (name ?? workdir basename), or
@@ -120,7 +208,7 @@ export class ProjectManager {
    *  ones so pi subprocesses re-read the credential file). Not-yet-started
    *  projects are absent by design — their first start reads the fresh file. */
   allRpcs(): PiRpc[] {
-    return [this.defaultRpc, ...this.projectRpcs.values()];
+    return [this.defaultRpc, ...this.projectRpcs.values(), ...this.threadRpcs.values()];
   }
 
   /** Reverse lookup: the project room that owns this rpc (undefined = shared
@@ -288,5 +376,15 @@ export class ProjectManager {
       await this.stopWithWarn(rpc);
     }
     this.projectRpcs.clear();
+    // fork: 线程车道一并回收,定时器停转。
+    for (const rpc of this.threadRpcs.values()) {
+      await this.stopWithWarn(rpc);
+    }
+    this.threadRpcs.clear();
+    this.threadLastUsed.clear();
+    if (this.threadReaper) {
+      clearInterval(this.threadReaper);
+      this.threadReaper = undefined;
+    }
   }
 }

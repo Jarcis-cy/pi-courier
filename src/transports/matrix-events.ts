@@ -50,6 +50,13 @@ export function createEventTranslator(ports: EventTranslatorPorts) {
   /** The common ExternalMessage envelope fields (no mention stripping on
    *  non-text payloads — filenames cannot carry a meaningful mention). */
   function envelope(roomId: string, event: any, isGroupChat: boolean) {
+    // fork: MSC3440 线程根 —— rel_type "m.thread" 的 event_id 即根。
+    // 时间线消息缺省 undefined;文本/媒体/不支持三类信封统一从这里带出。
+    const rel = event.content?.["m.relates_to"];
+    const threadRoot: string | undefined =
+      rel?.rel_type === "m.thread" && typeof rel.event_id === "string"
+        ? rel.event_id
+        : undefined;
     return {
       chatId: roomId,
       transport: transportType,
@@ -59,6 +66,7 @@ export function createEventTranslator(ports: EventTranslatorPorts) {
       messageId: event.event_id,
       isGroupChat,
       wasMentioned: false,
+      ...(threadRoot && { threadRoot }),
     };
   }
 

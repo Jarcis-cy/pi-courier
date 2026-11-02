@@ -51,9 +51,14 @@ export interface MatrixMessageContent {
   /** MSC2676 replacement payload — present only on edit events; same
    *  structure as an ordinary message's content. */
   "m.new_content"?: MatrixMessageContent;
-  /** MSC2676 relation — rel_type "m.replace" pointing at the original
-   *  event_id being replaced. */
-  "m.relates_to"?: { rel_type: string; event_id: string };
+  /** Relation — rel_type "m.replace" points at the replaced event (MSC2676);
+   *  "m.thread" points at the thread root (MSC3440, fork), optionally with a
+   *  fallback in-reply-to for clients without thread support. */
+  "m.relates_to"?: {
+    rel_type: string;
+    event_id: string;
+    "m.in_reply_to"?: { event_id: string };
+  };
 }
 
 /** Events the adapters subscribe to. room.join / room.leave deliver only

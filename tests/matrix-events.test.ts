@@ -294,3 +294,30 @@ describe("classifyMessageContent", () => {
     expect(c.kind === "media" && c.filename === "").toBe(true);
   });
 });
+
+describe("fork: MSC3440 线程根解析(threadSessions 的入站半边)", () => {
+  it("线程内消息携带 threadRoot = 根事件 id", async () => {
+    const { translator } = makeTranslator();
+    const event = textEvent("线程内的话", {
+      "m.relates_to": { rel_type: "m.thread", event_id: "$root1" },
+    });
+    const { message } = await translator.translate(ROOM, event);
+    expect(message?.threadRoot).toBe("$root1");
+    expect(message?.chatId).toBe(ROOM); // chatId 恒为房间 —— 门禁/审计口径不变
+  });
+
+  it("时间线消息与回复引用不误判为线程", async () => {
+    const { translator } = makeTranslator();
+    // 普通时间线消息
+    const plain = await translator.translate(ROOM, textEvent("普通消息"));
+    expect(plain.message?.threadRoot).toBeUndefined();
+    // m.in_reply_to 是回复不是线程
+    const reply = await translator.translate(
+      ROOM,
+      textEvent("回复的话", {
+        "m.relates_to": { "m.in_reply_to": { event_id: "$other" } },
+      })
+    );
+    expect(reply.message?.threadRoot).toBeUndefined();
+  });
+});

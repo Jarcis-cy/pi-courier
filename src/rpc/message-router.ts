@@ -68,7 +68,7 @@ export interface MessageRouterDeps {
   projectManager: ProjectManager;
   auth: ChallengeAuth;
   /** Send a text reply to a chat via a transport (errors swallowed by caller) */
-  sendReply: (chatId: string, transport: string, text: string) => Promise<void>;
+  sendReply: (chatId: string, transport: string, text: string, threadRoot?: string) => Promise<void>;
   /** Best-effort typing indicator (silent no-op when unavailable) */
   sendTyping: (chatId: string, transport: string) => Promise<void>;
   /** Injected config store — the single runtime read/write path. */
@@ -123,14 +123,14 @@ export interface MessageRouterDeps {
    * 才启用;缺省未注入 = 聚合整体禁用,行为与现状逐字节一致(旧部署、
    * 既有测试零影响)。
    */
-  editReply?: (chatId: string, transport: string, messageId: string, text: string) => Promise<void>;
+  editReply?: (chatId: string, transport: string, messageId: string, text: string, threadRoot?: string) => Promise<void>;
   /**
    * 发一张「活卡」新卡并取回底层 event_id(Matrix 的 sendMessage 穿出值,
    * 票1)——后续中间回合凭它对同一事件就地编辑。返回 undefined(非 Matrix
    * transport、发送失败被吞)= 本回合不进活卡状态,下一中间回合自然重试
    * 开卡。缺省未注入 = 聚合整体禁用(与 editReply 同门)。
    */
-  sendLiveCard?: (chatId: string, transport: string, text: string) => Promise<string | undefined>;
+  sendLiveCard?: (chatId: string, transport: string, text: string, threadRoot?: string) => Promise<string | undefined>;
   /** /update 热更新编排器(桥自更新 spec §8):组合根构造注入 —— slashCommands
    *  阶段按本消息预绑定 IO(reply 缝、adminRoom、allRpcs、audit)交给它。
    *  依赖面取最小结构(路由侧只调 handleCommand);Absent = /update 回
@@ -317,6 +317,27 @@ export function redactLoginDetail(text: string): string {
 
 export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
   const { projectManager, auth, sendReply, sendTyping, roomOps, store, pmctl, managementRoomAdoptionAllowed } = deps;
+
+  // fork: ReplyTarget 感知的发送包装 —— threadRoot 存在时回复进线程。
+  // 目标参数原样穿透,签名与底层缝一致;未注入的可选缝安全降级。
+  // 展开式传参:threadRoot 缺省时不追加第 4 参 —— 无线程路径的出站
+  // 调用形态与上游逐字节一致(测试与任何按参断言的下游都不受扰)。
+  const sendReplyT = (target: ReplyTarget, text: string): Promise<void> =>
+    target.threadRoot
+      ? sendReply(target.chatId, target.transport, text, target.threadRoot)
+      : sendReply(target.chatId, target.transport, text);
+  const sendLiveCardT = (target: ReplyTarget, text: string): Promise<string | undefined> =>
+    deps.sendLiveCard
+      ? target.threadRoot
+        ? deps.sendLiveCard(target.chatId, target.transport, text, target.threadRoot)
+        : deps.sendLiveCard(target.chatId, target.transport, text)
+      : Promise.resolve(undefined);
+  const editReplyT = (target: ReplyTarget, messageId: string, text: string): Promise<void> =>
+    deps.editReply
+      ? target.threadRoot
+        ? deps.editReply(target.chatId, target.transport, messageId, text, target.threadRoot)
+        : deps.editReply(target.chatId, target.transport, messageId, text)
+      : Promise.resolve();
   const bindings = new WeakMap<PiRpc, RoomBinding>();
   const bindReplyTarget = (rpc: PiRpc, replyTarget: ReplyTarget, pinned: boolean): void => {
     bindings.set(rpc, { pinned, replyTarget });
@@ -352,7 +373,7 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
         logger.warn(`queue lost on restart: ${view.count} message(s) had no bound room — notice dropped`);
         return;
       }
-      void sendReply(target.chatId, target.transport, t("queue.lost.notice", view));
+      void sendReplyT(target, t("queue.lost.notice", view));
     },
     persistQueueMirror
   );
@@ -369,7 +390,7 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
   // 项目房用项目链,其余走全局链;链空 = 功能关,行为与旧版逐字节一致。
   const fallbackStreak = new FallbackStreak();
 
-  const runFallback = async (rpc: PiRpc, origin: { chatId: string; transport: string }): Promise<void> => {
+  const runFallback = async (rpc: PiRpc, origin: ReplyTarget): Promise<void> => {
     if (!fallbackStreak.recordFailure(rpc)) return;
     const chain = projectManager.projectFallbacks(origin.chatId) ?? modelFallbackChain(store.get());
     if (chain.length === 0) return;
@@ -386,7 +407,8 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
         await sendReply(
           origin.chatId,
           origin.transport,
-          t("router.fallback.exhausted", { count: MODEL_FALLBACK_THRESHOLD, chain: chain.join(" → ") })
+          t("router.fallback.exhausted", { count: MODEL_FALLBACK_THRESHOLD, chain: chain.join(" → ") }),
+          origin.threadRoot
         );
       }
       return;
@@ -398,11 +420,12 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
       await sendReply(
         origin.chatId,
         origin.transport,
-        t("router.fallback.switchFailed", { count: MODEL_FALLBACK_THRESHOLD, to, message: errorMessage(err) })
+        t("router.fallback.switchFailed", { count: MODEL_FALLBACK_THRESHOLD, to, message: errorMessage(err) }),
+        origin.threadRoot
       );
       return;
     }
-    await sendReply(origin.chatId, origin.transport, t("router.fallback.switched", { count: MODEL_FALLBACK_THRESHOLD, from, to }));
+    await sendReply(origin.chatId, origin.transport, t("router.fallback.switched", { count: MODEL_FALLBACK_THRESHOLD, from, to }), origin.threadRoot);
     deps.audit?.append(
       AUDIT_EVENTS.modelFallback,
       "system",
@@ -494,7 +517,7 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
       if (state?.degraded) {
         // 降级中的序列退回逐条直发(旧行为;与聚合关闭时的中间回合同路)。
         for (const chunk of splitMessage(text, 4000)) {
-          await sendReply(target.chatId, target.transport, chunk).catch(() => {});
+          await sendReplyT(target, chunk).catch(() => {});
         }
         return;
       }
@@ -502,7 +525,7 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
         // 无活卡:发新卡并记录 event_id。拿不到 event_id(发送失败被吞/非
         // Matrix transport)仅记日志、不进活卡状态 —— 下一中间回合自然重试
         // 开卡(票3:发新卡失败仅记日志、不进活卡状态)。
-        const eventId = await sendLiveCard(target.chatId, target.transport, text).catch(() => undefined);
+        const eventId = await sendLiveCardT(target, text).catch(() => undefined);
         if (!eventId) {
           logger.debug(`live card: no event_id for ${target.chatId} — next turn retries opening one`);
           return;
@@ -526,21 +549,21 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
       if (splitMessage(merged, 4000).length > 1) {
         const chunks = splitMessage(text, 4000);
         try {
-          await editReply(target.chatId, target.transport, card.eventId, card.text);
+          await editReplyT(target, card.eventId, card.text);
         } catch (err) {
           // 定稿失败 = 编辑失败同语义:降级 + 本回合文本逐条直发补上。
           logger.warn(`live card finalize failed for ${target.chatId}: ${errorMessage(err)}`);
           if (!stale()) liveCards.set(rpc, { degraded: true });
           for (const chunk of chunks) {
-            await sendReply(target.chatId, target.transport, chunk).catch(() => {});
+            await sendReplyT(target, chunk).catch(() => {});
           }
           return;
         }
         for (const chunk of chunks.slice(0, -1)) {
-          await sendReply(target.chatId, target.transport, chunk).catch(() => {});
+          await sendReplyT(target, chunk).catch(() => {});
         }
         const lastChunk = chunks[chunks.length - 1]!;
-        const eventId = await sendLiveCard(target.chatId, target.transport, lastChunk).catch(() => undefined);
+        const eventId = await sendLiveCardT(target, lastChunk).catch(() => undefined);
         if (!eventId) {
           // 滚动开卡失败(spec #242 意见1):旧卡已定稿不再可编辑,清掉活卡
           // 状态让下一中间回合走「无活卡→开卡」自然重试 —— 与无卡开卡失败
@@ -555,7 +578,7 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
         return;
       }
       try {
-        await editReply(target.chatId, target.transport, card.eventId, merged);
+        await editReplyT(target, card.eventId, merged);
       } catch (err) {
         // 失败降级(票3):编辑抛错(不分类、不重试)→ 清活卡 + 置序列级
         // 降级标志 —— 同轮对话内后续中间回合全部逐条直发(旧行为),下一轮
@@ -564,7 +587,7 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
         logger.warn(`live card edit failed for ${target.chatId}: ${errorMessage(err)}`);
         if (!stale()) liveCards.set(rpc, { degraded: true });
         for (const chunk of splitMessage(text, 4000)) {
-          await sendReply(target.chatId, target.transport, chunk).catch(() => {});
+          await sendReplyT(target, chunk).catch(() => {});
         }
         return;
       }
@@ -676,7 +699,7 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
       if (Date.now() - prevCard.lastEditAt < WORKFLOW_DEGRADED_RETRY_MS) return;
       void (async () => {
         try {
-          await editReply(target.chatId, target.transport, prevCard.eventId, text);
+          await editReplyT(target, prevCard.eventId, text);
         } catch (err) {
           logger.warn(`workflow card degraded retry failed for ${target.chatId}: ${errorMessage(err)}`);
           return;
@@ -704,7 +727,7 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
       if (supersededPending && supersededCard) {
         supersededCard.finalized = true;
         try {
-          await editReply(target.chatId, target.transport, supersededCard.eventId, `${supersededCard.text}\n\n${t("workflow.card.superseded")}`);
+          await editReplyT(target, supersededCard.eventId, `${supersededCard.text}\n\n${t("workflow.card.superseded")}`);
         } catch (err) {
           // 旧卡补编辑失败不阻塞新卡:旧卡就地定稿失败,标记降级即可。
           logger.warn(`workflow card interrupt-edit failed for ${target.chatId}: ${errorMessage(err)}`);
@@ -714,7 +737,7 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
         if (stale()) return;
       }
       if (!prevCard) {
-        const eventId = await sendLiveCard(target.chatId, target.transport, text).catch(() => undefined);
+        const eventId = await sendLiveCardT(target, text).catch(() => undefined);
         if (!eventId) {
           // 开卡失败不留状态:下一快照自然重试开卡。
           logger.debug(`workflow card: no event_id for ${target.chatId} — next snapshot retries opening one`);
@@ -726,7 +749,7 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
         return;
       }
       try {
-        await editReply(target.chatId, target.transport, prevCard.eventId, text);
+        await editReplyT(target, prevCard.eventId, text);
       } catch (err) {
         // 失败降级:保留最后一次成功 text,置 degraded,放大间隔重试。
         logger.warn(`workflow card edit failed for ${target.chatId}: ${errorMessage(err)}`);
@@ -745,7 +768,7 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
 
   /** 卡片投递:当前房间必发;多工程下有管理房且不同于本房间时抄送一份
    *  「📋 <项目名> 交接卡」,沉淀为该项目的干活日志时间线。 */
-  const deliverRecapCard = async (rpc: PiRpc, body: string, origin: { chatId: string; transport: string }): Promise<void> => {
+  const deliverRecapCard = async (rpc: PiRpc, body: string, origin: ReplyTarget): Promise<void> => {
     let context: string | null = null;
     try {
       context = (await collectStatusFooter(rpc)).context;
@@ -765,7 +788,7 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
     // 超长单条会撞 Matrix 事件大小上限 —— 分片保证卡片一定送达。
     const ccPrefix = project ? `${recapCcPrefix(project)}\n\n` : "";
     for (const chunk of splitMessage(card, 4000)) {
-      await sendReply(origin.chatId, origin.transport, chunk);
+      await sendReply(origin.chatId, origin.transport, chunk, origin.threadRoot);
     }
     const managementRoom = managementRoomId(store.get());
     if (managementRoom && managementRoom !== origin.chatId) {
@@ -778,7 +801,7 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
 
   /** /recap:忙碌拒绝在先(不与在跑任务争抢 steering 语义),空会话拒绝
    *  其次(轮数不足没得总结),然后才是一次真实模型调用。 */
-  const runRecap = async (rpc: PiRpc, origin: { chatId: string; transport: string }): Promise<void> => {
+  const runRecap = async (rpc: PiRpc, origin: ReplyTarget): Promise<void> => {
     const state = await rpc.requireClient().getState();
     if (state.isStreaming) throw new RecapBusyError();
     if (recapLedger.count(rpc) < RECAP_MIN_TURNS) throw new RecapEmptyError();
@@ -788,7 +811,7 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
 
   /** /new //clear 前的自动出卡(recap.onNew 开 + 轮数达标)。任何失败只
    *  warn —— 交接卡是锦上添花,永远不能变成 /new 的单点故障(钉点测试)。 */
-  const beforeNewRecap = async (rpc: PiRpc, origin: { chatId: string; transport: string }): Promise<void> => {
+  const beforeNewRecap = async (rpc: PiRpc, origin: ReplyTarget): Promise<void> => {
     if (!recapOnNew(store.get())) return;
     try {
       const state = await rpc.requireClient().getState();
@@ -885,10 +908,10 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
     mirrors.attach(rpc, dir, {
       onExternalMessage: (entry) => mirrorForward(entry, target),
       onFork: () => {
-        sendReply(target.chatId, target.transport, t("mirror.fork.warning")).catch(() => {});
+        sendReplyT(target, t("mirror.fork.warning")).catch(() => {});
       },
       onForeignSession: (file) => {
-        sendReply(target.chatId, target.transport, t("mirror.newSession.notice", { file })).catch(() => {});
+        sendReplyT(target, t("mirror.newSession.notice", { file })).catch(() => {});
       },
     }, leafId, state.sessionFile, querySelfEntryIds);
     // 附加命令用会话文件路径而非 id:实测 pi 1.0 的 id 查找在本布局下不可靠
@@ -910,14 +933,14 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
       if (entry.role === "user") {
         const text = extractUserText(entry.message);
         if (text) {
-          sendReply(target.chatId, target.transport, t("mirror.user", { text: truncate(text, 3000) })).catch(() => {});
+          sendReplyT(target, t("mirror.user", { text: truncate(text, 3000) })).catch(() => {});
         }
         return;
       }
       if (entry.role === "assistant") {
         const turn = buildTurnReply(entry.message as AssistantMessage, true);
         if (turn.text) {
-          sendReply(target.chatId, target.transport, t("mirror.assistant", { text: truncate(turn.text, 3000) })).catch(() => {});
+          sendReplyT(target, t("mirror.assistant", { text: truncate(turn.text, 3000) })).catch(() => {});
         }
       }
     } catch {
@@ -966,19 +989,20 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
         if (!ctx.isAuthorized) return true;
         switch (ctx.msg.payload.kind) {
           case "mediaError":
-            await sendReply(ctx.msg.chatId, ctx.msg.transport, attachmentErrorReply(ctx.msg.payload.reason));
+            await sendReply(ctx.msg.chatId, ctx.msg.transport, attachmentErrorReply(ctx.msg.payload.reason), ctx.msg.threadRoot);
             return true;
           case "unsupported":
             await sendReply(
               ctx.msg.chatId,
               ctx.msg.transport,
-              t("router.payload.unsupported", { msgtype: ctx.msg.payload.msgtype })
+              t("router.payload.unsupported", { msgtype: ctx.msg.payload.msgtype }),
+              ctx.msg.threadRoot
             );
             return true;
           case "media": {
             attachmentLedger.park(ctx.msg.chatId, ctx.msg.userId, ctx.msg.payload.saved);
             for (const attachment of ctx.msg.payload.saved) {
-              await sendReply(ctx.msg.chatId, ctx.msg.transport, attachmentSavedReply(attachment));
+              await sendReply(ctx.msg.chatId, ctx.msg.transport, attachmentSavedReply(attachment), ctx.msg.threadRoot);
             }
             return true;
           }
@@ -1309,8 +1333,8 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
             // 交接卡(issue #122):/recap 与 /new 联动,均绑定本消息的房间
             // 与进程;卡片投递(含管理房抄送)在 deliverRecapCard 内。
             recap: {
-              run: () => runRecap(rpc, { chatId: ctx.msg.chatId, transport: ctx.msg.transport }),
-              beforeNew: () => beforeNewRecap(rpc, { chatId: ctx.msg.chatId, transport: ctx.msg.transport }),
+              run: () => runRecap(rpc, { chatId: ctx.msg.chatId, transport: ctx.msg.transport, username: ctx.msg.username, ...(ctx.msg.threadRoot && { threadRoot: ctx.msg.threadRoot }) }),
+              beforeNew: () => beforeNewRecap(rpc, { chatId: ctx.msg.chatId, transport: ctx.msg.transport, username: ctx.msg.username, ...(ctx.msg.threadRoot && { threadRoot: ctx.msg.threadRoot }) }),
               onSwitched: () => recapLedger.reset(rpc),
             },
             // /remind(issue #117):命令层不接触 chatId/userId —— 这里按本消息
@@ -1525,18 +1549,33 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
           // 懒解析(spec #72 票3):pi 进程只为真正需要它的阶段启动——
           // 命令族(附件/pmux 管理命令/登录)不触发 spawn。失败回执后以
           // RPC_ABORT 静默终止管道(通用错误由 standalone 兜底)。
-          rpcOnce ??= Promise.resolve(projectManager.getRpcForRoom(msg.chatId)).then((rpc) => {
+          // fork: 线程车道优先 —— threadSessions 开启时群消息按
+          // 「所在线程的根;时间线消息以自身」走专属子进程,回复发回线程。
+          const laneRoot =
+            store.get().threadSessions && msg.isGroupChat
+              ? (msg.threadRoot ?? msg.messageId)
+              : undefined;
+          rpcOnce ??= Promise.resolve(
+            laneRoot
+              ? projectManager.getThreadRpc(msg.chatId, laneRoot)
+              : projectManager.getRpcForRoom(msg.chatId)
+          ).then((rpc) => {
             // Per-process binding (see RoomBinding above) — resolution time is
             // the natural bind point: project rooms pin, the shared default
             // rpc follows its latest prompter.
             bindReplyTarget(
               rpc,
-              { chatId: msg.chatId, transport: msg.transport, username: msg.username },
+              {
+                chatId: msg.chatId,
+                transport: msg.transport,
+                username: msg.username,
+                ...(laneRoot && { threadRoot: laneRoot }),
+              },
               projectManager.isProjectRoom(msg.chatId)
             );
             return rpc;
           }).catch((err: unknown) => {
-            void sendReply(msg.chatId, msg.transport, t("router.rpc.startFailed", { message: errorMessage(err) }));
+            void sendReply(msg.chatId, msg.transport, t("router.rpc.startFailed", { message: errorMessage(err) }), laneRoot);
             throw RPC_ABORT;
           });
           return rpcOnce;
@@ -1662,7 +1701,7 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
               // —— 降级绑定旧卡 event_id 上的编辑失败,断链后的新卡自然重试。
               clearLiveCard(rpc);
               for (const chunk of splitMessage(narration, 4000)) {
-                await sendReply(target.chatId, target.transport, chunk).catch(() => {});
+                await sendReplyT(target, chunk).catch(() => {});
               }
             }
             await liveCardTurn(rpc, target, toolLines);
@@ -1685,7 +1724,7 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
             );
           }
           for (const chunk of outgoing) {
-            sendReply(target.chatId, target.transport, chunk).catch(() => {});
+            sendReplyT(target, chunk).catch(() => {});
           }
         };
         void dispatch();
