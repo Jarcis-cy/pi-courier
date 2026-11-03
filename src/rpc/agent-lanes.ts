@@ -132,6 +132,10 @@ export function parseAgentMentions(
 ): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
+  // 桥接账号自己的用户名:它在名册里可能也有同名定义(比如管家 steward.md),
+  // 但 `@steward` 永远是"跟这个账号说话",不是"派给同名专家" —— 带不带
+  // `:server` 都排除,否则同一个名字既是账号又是虚拟角色,回复会串身份。
+  const botName = botUserId ? /^@([^:]+):/.exec(botUserId)?.[1]?.toLowerCase() : undefined;
   // 前置边界:「@」前面不能紧贴 ASCII 字母/数字/下划线/连字符 —— 这样邮箱
   // `a@researcher.com` 不会被误认,而中文紧邻(`帮我@critic`)、标点、空白、
   // 行首都照常生效(中文输入法下最常见的写法)。前置字符被这条正则一并吃掉,
@@ -140,6 +144,7 @@ export function parseAgentMentions(
   for (const m of text.matchAll(re)) {
     const name = m[1]!;
     const server = m[2];
+    if (botName && name.toLowerCase() === botName) continue;
     if (botUserId && server && botUserId.toLowerCase() === `@${name}:${server}`.toLowerCase()) continue;
     if (!roster.has(name)) continue;
     if (seen.has(name)) continue;

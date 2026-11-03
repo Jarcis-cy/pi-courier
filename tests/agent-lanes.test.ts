@@ -47,6 +47,15 @@ describe("@-解析(文本形态)", () => {
     ).toEqual([]);
   });
 
+  it("裸 @bot 用户名也不当 Agent 目标(哪怕名册里有同名定义)", () => {
+    // 名册里同时存在 steward 时,`@steward` 仍应视为"跟账号说话"
+    const withBot = new Set([...ROSTER, "steward"]);
+    expect(parseAgentMentions("@steward 介绍一下你自己", withBot, "@steward:matrix.localhost")).toEqual([]);
+    expect(
+      parseAgentMentions("@steward:matrix.localhost 介绍一下你自己", withBot, "@steward:matrix.localhost")
+    ).toEqual([]);
+  });
+
   it("邮箱不会被误认(前置字符是 ASCII 字母)", () => {
     expect(parseAgentMentions("发到 a@researcher.com", ROSTER)).toEqual([]);
   });
