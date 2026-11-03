@@ -48,7 +48,7 @@ import { Heartbeat } from "./resilience/heartbeat.js";
 import { clearManualStop, manualStopMarkerPath, markManualStop } from "./resilience/manual-stop.js";
 import { ResourceGuard } from "./resilience/resource-guard.js";
 import { WriteFailureRecorder } from "./resilience/write-failure.js";
-import { HopGuard, scanAgentRoster, ThreadHistory } from "./rpc/agent-lanes.js";
+import { HopGuard, parseAgentMentions, scanAgentRoster, ThreadHistory } from "./rpc/agent-lanes.js";
 import type { PersistedAttachmentEntry } from "./rpc/attachment-ledger.js";
 import { createMcpOrchestration } from "./rpc/command-map.js";
 import { createMessageRouter } from "./rpc/message-router.js";
@@ -267,10 +267,18 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   // 细节。第二个消息 transport 真正出现时,在这里重新立 seam。
   let matrix: MatrixProvider | undefined;
   let roomOps: RoomOps | undefined;
+  // fork: agentLanes 的路由名单在下面才算得出,这里先留槽 —— matrix 构造时
+  // 通过闭包引用它,运行期(收到消息时)才求值。
+  let isAgentMention: ((text: string) => boolean) | undefined;
 
   if (config.matrix?.homeserverUrl && config.matrix?.accessToken) {
     // 赋值给外层变量(内层 const 会遮蔽,导致 !matrix 恒真——真机冒烟抓到)
-    matrix = new MatrixProvider(config.matrix, (chatId) => auth.isChannelEnabled(chatId));
+    matrix = new MatrixProvider(
+      config.matrix,
+      (chatId) => auth.isChannelEnabled(chatId),
+      undefined,
+      (text) => isAgentMention?.(text) ?? false
+    );
     // Attachment intake (issue #66): the store needs the Matrix client for
     // downloads, so it is created here and handed to the provider. Both read
     // config at construction time — changes take effect on restart like every
@@ -363,6 +371,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         const historyLimit = config.agentHistoryLimit ?? 30;
         const maxHops = config.maxAgentHops ?? 6;
         logger.info(`👤 Agent 车道已启用:${roster.size} 个定义(${dirs.join(", ")})`);
+        // 「@<在册 Agent>」等同于被 mention:channels 的 mentions 门禁要放行它,
+        // 否则群里直接 @ 专家会被 transport 层丢掉,根本进不了路由。
+        isAgentMention = (text: string): boolean =>
+          parseAgentMentions(text, new Set(roster.keys()), matrix?.userId ?? "").length > 0;
         return {
           roster,
           dirs,

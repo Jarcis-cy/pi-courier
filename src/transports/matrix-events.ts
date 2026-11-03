@@ -33,6 +33,10 @@ export interface EventTranslatorPorts {
   /** Attachment persistence; absent = media events keep the legacy
    *  skip-silently behaviour (bare transports in tests). */
   attachments?: AttachmentStore;
+  /** 群消息是否点名了某个在册 Agent(fork: agentLanes)。为 true 时与
+   *  「@ 了机器人」同等看待 —— 否则 channels 的 mentions 门禁会把
+   *  `@test-ops` 这类消息直接丢掉。缺省 = 只看 bot。 */
+  isAgentMention?: (text: string) => boolean;
 }
 
 export interface TranslatedEvent {
@@ -45,7 +49,7 @@ export interface TranslatedEvent {
 }
 
 export function createEventTranslator(ports: EventTranslatorPorts) {
-  const { transportType, botUserId, quoteCache, resolveIsGroupChat, attachments } = ports;
+  const { transportType, botUserId, quoteCache, resolveIsGroupChat, attachments, isAgentMention } = ports;
 
   /** The common ExternalMessage envelope fields (no mention stripping on
    *  non-text payloads — filenames cannot carry a meaningful mention). */
@@ -103,7 +107,9 @@ export function createEventTranslator(ports: EventTranslatorPorts) {
     const messageId = event.event_id;
     const isGroupChat = await resolveIsGroupChat(roomId);
 
-    const wasMentioned = isGroupChat ? wasBotMentioned(messageText, botUserId) : false;
+    const wasMentioned = isGroupChat
+      ? wasBotMentioned(messageText, botUserId) || Boolean(isAgentMention?.(messageText))
+      : false;
     const cleanContent = wasMentioned && botUserId
       ? stripBotMention(messageText, botUserId)
       : messageText;

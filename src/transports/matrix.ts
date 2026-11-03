@@ -71,7 +71,9 @@ export class MatrixProvider {
      *  lives in the message-router pipeline). */
     private isRoomEnabled: (chatId: string) => boolean,
     /** Client factory seam (tests inject fakes; production uses the default). */
-    private clientFactory: MatrixClientFactory = createMatrixClient
+    private clientFactory: MatrixClientFactory = createMatrixClient,
+    /** fork: 群消息点名在册 Agent 时也视为"被 mention"(agentLanes 用)。 */
+    private isAgentMention?: (text: string) => boolean
   ) {}
 
   /**
@@ -128,6 +130,7 @@ export class MatrixProvider {
       quoteCache: this.quoteCache,
       resolveIsGroupChat: (roomId) => this.resolveIsGroupChat(roomId),
       ...(this.attachments ? { attachments: this.attachments } : {}),
+      ...(this.isAgentMention ? { isAgentMention: this.isAgentMention } : {}),
     });
 
     // Track room membership and member counts
