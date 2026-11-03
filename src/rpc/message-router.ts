@@ -370,15 +370,6 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
   // ── fork: 停止意图 ───────────────────────────────────────────────────
   // 群里说人话就该能叫停。这条只在「本进程正在跑」时才生效(空闲时当
   // 普通消息处理),所以不会把「这个服务怎么停止」这类提问误当成指令。
-  const looksLikeStop = (text: string): boolean => {
-    const t = text.trim();
-    if (!t) return false;
-    // 太长的不算指令(避免把讨论里的一句"需要停止吗"当命令)
-    if (t.length > 60) return false;
-    return /^(停|别|取消|cancel|stop|abort|halt)\b/i.test(t)
-      || /(停下|停止|别做了|不要做了|先停|暂停一下|叫停|cancel)/.test(t);
-  };
-
   // ── fork: Agent 车道 ─────────────────────────────────────────────────
   // 线程历史键 = 房间 + 车道根(与车道键同源,只是不带 Agent 名)。
   const threadKeyOf = (roomId: string, laneRoot: string): string => `${roomId}\u0000${laneRoot}`;
@@ -1598,34 +1589,6 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
         if (ctx.text.startsWith("/")) return false;
         const rpc = await ctx.roomRpc();
         return questions.deliver(rpc, ctx.text, ctx.msg, ctx.log);
-      },
-    },
-    {
-      name: "stopIntent",
-      preAuth: false,
-      consumesLedger: false,
-      needsRpc: true,
-      // fork: 「停下」「别做了」这类话,在本进程正在跑时直接 abort ——
-      // 群里的自然语言应当能叫停,不必逼用户记 /stop。空闲时返回 false,
-      // 消息照常走后面的管道(所以"怎么停止某个服务"这种问句不受影响)。
-      handle: async (ctx) => {
-        if (!looksLikeStop(ctx.text)) return false;
-        const rpc = await ctx.roomRpc();
-        const state = await rpc.requireClient().getState().catch(() => undefined);
-        if (!state?.isStreaming) return false;
-        // abort 之后顺手清队:否则排队里的旧指令会立刻接着跑,用户会
-        // 看到"停了又动"。clearQueue 不在公开类型面上,按可用性调用。
-        const client = rpc.requireClient() as unknown as {
-          abort(): Promise<void>;
-          clearQueue?: () => Promise<void>;
-        };
-        await client.abort().catch(() => {});
-        if (typeof client.clearQueue === "function") {
-          await client.clearQueue().catch(() => {});
-        }
-        logger.info("[agent] 用户叫停(自然语言),已 abort 当前回合");
-        await sendReplyT({ chatId: ctx.msg.chatId, transport: ctx.msg.transport, username: ctx.msg.username }, t("router.stopIntent.stopped")).catch(() => {});
-        return true;
       },
     },
     {

@@ -272,3 +272,5 @@ export function stripAgentLabel(agent: string, text: string): string {
   const prefix = `[${agent}] `;
   return text.startsWith(prefix) ? text.slice(prefix.length) : text;
 }
+
+
