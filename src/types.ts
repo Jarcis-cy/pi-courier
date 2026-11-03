@@ -155,6 +155,12 @@ export interface MsgBridgeConfig {
   agentHistoryLimit?: number;
   /** Agent 车道空闲回收阈值(分钟,默认 30)。 */
   agentLaneIdleMinutes?: number;
+  /**
+   * 扩展通知进房间的最低级别(默认 "warning")。设成 "info" 时,扩展用
+   * notify(info) 给出的普通提示也会发到房间 —— 适配那些"命令输出只走
+   * notify"的插件(如记忆插件的 /expert)。
+   */
+  extensionNotifyLevel?: "info" | "warning" | "error";
   /** 显式指定 pi 的 cli.js 路径(默认:PI_CLI_PATH → which pi → 本地 node_modules) */
   cliPath?: string;
   /** 日志级别:debug | info | warn | error(默认 info;`pi-courier logs --level debug` 可查看全量) */

@@ -124,6 +124,9 @@ export interface ExtensionQuestionsDeps {
   respond: (rpc: PiRpc, payload: ExtensionUIResponsePayload) => Promise<void>;
   /** 超时时长来源(extensionUiTimeoutMs(config) 派生;入队时读取一次)。 */
   timeoutMs: () => number;
+  /** 扩展通知进房间的最低级别(默认 warning)。设成 info 时,扩展的普通
+   *  提示也会出现在房间里 —— 给 /expert 这类"命令输出走 notify"的插件用。 */
+  notifyLevel?: () => "info" | "warning" | "error";
   /** 重启生命周期订阅(与 RpcTransientState 同一接缝):子进程重启后,新
    *  进程对旧提问一无所知 —— 队列与计时器全部作废。缺省 = 不订阅。 */
   subscribeRestart?: (rpc: PiRpc, handler: (rpc: PiRpc) => void) => void;
@@ -194,11 +197,16 @@ export class ExtensionQuestions {
         return;
       }
       case "notify": {
-        // Presentational: only warning/error reach the room, info stays in
-        // the log — the room is not a dumping ground for progress chatter.
+        // Presentational: by default only warning/error reach the room, info
+        // stays in the log — the room is not a dumping ground for progress
+        // chatter. `extensionNotifyLevel: "info"` opts a deployment in: some
+        // plugins answer commands through notify only (e.g. /expert), so the
+        // strictly-filtered default would swallow their output entirely.
         const level = request.notifyType ?? "info";
         const message = truncateLine(request.message ?? "", 500);
-        if (level === "warning" || level === "error") {
+        const order: Record<string, number> = { info: 0, warning: 1, error: 2 };
+        const floor = this.deps.notifyLevel?.() ?? "warning";
+        if ((order[level] ?? 1) >= (order[floor] ?? 1)) {
           if (target) {
             const icon = level === "error" ? "🔴" : "⚠️";
             this.deps.sendReply(target.chatId, target.transport, `${icon} ${t("xq.notify", { message })}`).catch((err: unknown) => {

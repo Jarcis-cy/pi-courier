@@ -1002,6 +1002,9 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
     sendReply,
     respond: (rpc, payload) => rpc.respondExtensionUI(payload),
     timeoutMs: () => extensionUiTimeoutMs(store.get()),
+    // 扩展通知进房间的门槛:默认 warning(降噪);部署可开到 info 以接收
+    // 那些「命令输出只走 notify」的插件回执(如 /expert)。
+    notifyLevel: () => store.get().extensionNotifyLevel ?? "warning",
     subscribeRestart: (rpc, handler) => rpc.onRestarted?.(handler),
   });
 
