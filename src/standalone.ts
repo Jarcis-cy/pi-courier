@@ -277,7 +277,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       config.matrix,
       (chatId) => auth.isChannelEnabled(chatId),
       undefined,
-      (text) => isAgentMention?.(text) ?? false
+      (text) => isAgentMention?.(text) ?? false,
+      // 线程内免 @:开了线程会话就当进了讨论串就是在对话,不再要求每条 @。
+      () => config.threadSessions === true
     );
     // Attachment intake (issue #66): the store needs the Matrix client for
     // downloads, so it is created here and handed to the provider. Both read

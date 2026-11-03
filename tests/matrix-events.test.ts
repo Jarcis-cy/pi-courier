@@ -306,6 +306,26 @@ describe("fork: MSC3440 线程根解析(threadSessions 的入站半边)", () => 
     expect(message?.chatId).toBe(ROOM); // chatId 恒为房间 —— 门禁/审计口径不变
   });
 
+  it("isThreadFree 开启时,线程内消息视同被点名(免 @)", async () => {
+    const translator = createEventTranslator({
+      transportType: "matrix",
+      botUserId: BOT,
+      quoteCache: createQuoteCache(),
+      resolveIsGroupChat: async () => true,
+      isThreadFree: () => true,
+    });
+    const inThread = textEvent("悄悄说一句", {
+      "m.relates_to": { rel_type: "m.thread", event_id: "$root1" },
+    });
+    const { message } = await translator.translate(ROOM, inThread);
+    expect(message?.wasMentioned).toBe(true);
+    expect(message?.threadRoot).toBe("$root1");
+
+    // 时间线消息不受影响
+    const timeline = await translator.translate(ROOM, textEvent("时间线的话"));
+    expect(timeline.message?.wasMentioned).toBe(false);
+  });
+
   it("时间线消息与回复引用不误判为线程", async () => {
     const { translator } = makeTranslator();
     // 普通时间线消息

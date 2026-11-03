@@ -37,6 +37,10 @@ export interface EventTranslatorPorts {
    *  「@ 了机器人」同等看待 —— 否则 channels 的 mentions 门禁会把
    *  `@test-ops` 这类消息直接丢掉。缺省 = 只看 bot。 */
   isAgentMention?: (text: string) => boolean;
+  /** 线程内免 @(fork):为 true 时,发在某条线程里的消息视同被点名 ——
+   *  进了讨论串就是在跟这个 Agent 说话,不该每条都 @ 一次。
+   *  缺省 = 关闭(仍要求 @)。 */
+  isThreadFree?: (threadRoot: string) => boolean;
 }
 
 export interface TranslatedEvent {
@@ -49,7 +53,7 @@ export interface TranslatedEvent {
 }
 
 export function createEventTranslator(ports: EventTranslatorPorts) {
-  const { transportType, botUserId, quoteCache, resolveIsGroupChat, attachments, isAgentMention } = ports;
+  const { transportType, botUserId, quoteCache, resolveIsGroupChat, attachments, isAgentMention, isThreadFree } = ports;
 
   /** The common ExternalMessage envelope fields (no mention stripping on
    *  non-text payloads — filenames cannot carry a meaningful mention). */
@@ -107,8 +111,14 @@ export function createEventTranslator(ports: EventTranslatorPorts) {
     const messageId = event.event_id;
     const isGroupChat = await resolveIsGroupChat(roomId);
 
+    const relForThread = event.content?.["m.relates_to"];
+    const threadRootForFree: string | undefined =
+      relForThread?.rel_type === "m.thread" && typeof relForThread.event_id === "string"
+        ? relForThread.event_id
+        : undefined;
+    const threadFree = isGroupChat && threadRootForFree && isThreadFree ? isThreadFree(threadRootForFree) : false;
     const wasMentioned = isGroupChat
-      ? wasBotMentioned(messageText, botUserId) || Boolean(isAgentMention?.(messageText))
+      ? wasBotMentioned(messageText, botUserId) || Boolean(isAgentMention?.(messageText)) || threadFree
       : false;
     const cleanContent = wasMentioned && botUserId
       ? stripBotMention(messageText, botUserId)
