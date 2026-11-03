@@ -44,6 +44,9 @@ export class MatrixProvider {
   private connectedAt = 0;
   /** Per-room event_id → excerpt ring cache backing reply quotes (issue #56 票5). */
   private quoteCache: QuoteCache = createQuoteCache();
+  /** fork: 本账号发过言的线程根。线程内免 @ 只对这些线程生效 ——
+   *  归属清楚了,别的 Agent 的串不会被误唤醒。 */
+  private ownThreads = new Set<string>();
   /** Attachment storage (issue #66) — wired by the composition root. */
   private attachments?: AttachmentStore;
   /** Event translator (spec #72 票2/C2) — assembled once botUserId is known. */
@@ -74,8 +77,10 @@ export class MatrixProvider {
     private clientFactory: MatrixClientFactory = createMatrixClient,
     /** fork: 群消息点名在册 Agent 时也视为"被 mention"(agentLanes 用)。 */
     private isAgentMention?: (text: string) => boolean,
-    /** fork: 线程内消息免 @(threadSessions 开启时用)。 */
-    private isThreadFree?: (threadRoot: string) => boolean
+    /** fork: 线程会话。开启时,本账号**参与过**的线程内消息免 @;
+     *  没参与过的线程(别人的串)仍然要 @ 才进 —— 否则群里任何线程都会
+     *  把本账号唤醒,变成到处插嘴。 */
+    private threadSessions?: boolean
   ) {}
 
   /**
@@ -133,7 +138,7 @@ export class MatrixProvider {
       resolveIsGroupChat: (roomId) => this.resolveIsGroupChat(roomId),
       ...(this.attachments ? { attachments: this.attachments } : {}),
       ...(this.isAgentMention ? { isAgentMention: this.isAgentMention } : {}),
-      ...(this.isThreadFree ? { isThreadFree: this.isThreadFree } : {}),
+      ...(this.threadSessions ? { isThreadFree: (root: string) => this.ownThreads.has(root) } : {}),
     });
 
     // Track room membership and member counts
@@ -261,6 +266,8 @@ export class MatrixProvider {
    * 供不支持线程的客户端回退渲染。
    */
   async sendMessage(chatId: string, text: string, threadRoot?: string): Promise<string> {
+    // 记下"这个串我参与过":后续该串的消息免 @ 才只对本账号生效。
+    if (threadRoot) this.ownThreads.add(threadRoot);
     if (!this.client) {
       throw new Error("Matrix client not connected");
     }
