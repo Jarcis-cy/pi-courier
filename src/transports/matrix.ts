@@ -1,3 +1,6 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import MarkdownIt from "markdown-it";
 import type { InboxMode } from "../config.js";
 import { escapeBackslashesOutsideFences } from "../formatting.js";
@@ -45,8 +48,9 @@ export class MatrixProvider {
   /** Per-room event_id → excerpt ring cache backing reply quotes (issue #56 票5). */
   private quoteCache: QuoteCache = createQuoteCache();
   /** fork: 本账号发过言的线程根。线程内免 @ 只对这些线程生效 ——
-   *  归属清楚了,别的 Agent 的串不会被误唤醒。 */
+   *  归属清楚了,别的 Agent 的串不会被误唤醒。落盘,重启不丢。 */
   private ownThreads = new Set<string>();
+  private readonly threadsFile = path.join(os.homedir(), ".pi", "pi-courier-threads.json");
   /** Attachment storage (issue #66) — wired by the composition root. */
   private attachments?: AttachmentStore;
   /** Event translator (spec #72 票2/C2) — assembled once botUserId is known. */
@@ -84,7 +88,34 @@ export class MatrixProvider {
     /** fork: 信任用户判断。线程免 @ 只对信任用户生效,否则两个 Agent 会
      *  在同一个串里互相唤醒成死循环。 */
     private isTrustedSender?: (userId: string) => boolean
-  ) {}
+  ) {
+    this.loadOwnThreads();
+  }
+
+  /** 重启后恢复「我参与过哪些串」,否则免 @ 会全部失效,用户必须重新 @。 */
+  private loadOwnThreads(): void {
+    try {
+      const raw = fs.readFileSync(this.threadsFile, "utf-8");
+      const arr = JSON.parse(raw) as unknown;
+      if (!Array.isArray(arr)) return;
+      for (const item of arr) {
+        if (typeof item === "string" && item) this.ownThreads.add(item);
+      }
+    } catch {
+      // 首次启动没有文件,或文件损坏 —— 从空集开始,下次发言再记。
+    }
+  }
+
+  private saveOwnThreads(): void {
+    try {
+      fs.mkdirSync(path.dirname(this.threadsFile), { recursive: true });
+      // 只留最近 500 条,避免无限增长。
+      const kept = [...this.ownThreads].slice(-500);
+      fs.writeFileSync(this.threadsFile, JSON.stringify(kept));
+    } catch (err) {
+      logger.warn(`[matrix] 线程归属落盘失败(免 @ 重启后会丢): ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 
   /**
    * Wire the attachment store (issue #66) after construction — the store is
@@ -274,8 +305,11 @@ export class MatrixProvider {
    * 供不支持线程的客户端回退渲染。
    */
   async sendMessage(chatId: string, text: string, threadRoot?: string): Promise<string> {
-    // 记下"这个串我参与过":后续该串的消息免 @ 才只对本账号生效。
-    if (threadRoot) this.ownThreads.add(threadRoot);
+    // 记下"这个串我参与过":后续该串的消息免 @ 才只对本账号生效。落盘,重启不丢。
+    if (threadRoot && !this.ownThreads.has(threadRoot)) {
+      this.ownThreads.add(threadRoot);
+      this.saveOwnThreads();
+    }
     if (!this.client) {
       throw new Error("Matrix client not connected");
     }
