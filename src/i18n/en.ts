@@ -419,6 +419,7 @@ const en: Record<MessageKey, string> = {
   "router.agent.hopLimit": "⚠️ Agents have @-ed each other {max} hops in a row; automatic forwarding stopped. @ the target agent directly to continue.",
   "router.agent.startFailed": "❌ Could not start the lane for agent \"{agent}\": {message}",
   "router.agent.unknown": "⚠️ No agent definition named \"{agent}\" was found.",
+  "router.stopIntent.stopped": "✅ Stopped the running task. Say the word when you want to pick it up again.",
   "router.retry.inProgress": "⚠️ Call failed, retrying {attempt}/{max}: {error}",
   "router.retry.exhausted": "❌ Auto-retry exhausted: {error}",
   "router.fallback.switched":

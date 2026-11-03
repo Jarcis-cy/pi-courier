@@ -408,6 +408,7 @@ const zh = {
   "router.agent.hopLimit": "⚠️ Agent 互 @ 已连续 {max} 跳，已停止自动转发。需要继续请直接 @ 目标 Agent。",
   "router.agent.startFailed": "❌ 无法启动 Agent「{agent}」的车道: {message}",
   "router.agent.unknown": "⚠️ 没有找到名为「{agent}」的 Agent 定义。",
+  "router.stopIntent.stopped": "✅ 已叫停当前任务。需要重新开始时说一声。",
   "router.retry.inProgress": "⚠️ 调用失败,正在重试 {attempt}/{max}: {error}",
   "router.retry.exhausted": "❌ 自动重试耗尽: {error}",
   "router.fallback.switched": "⚠️ 连续 {count} 轮失败,已自动切换模型: {from} → {to}。provider 恢复后发 /model {from} 可切回。",
