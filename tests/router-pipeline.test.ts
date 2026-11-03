@@ -40,6 +40,7 @@ describe("pipeline stage table (spec #72 票3/C1)", () => {
       "bashBang",
       "loginCapture",
       "extensionCapture",
+      "agentLanes",
       "prompt",
     ]);
   });

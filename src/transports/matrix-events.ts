@@ -57,6 +57,12 @@ export function createEventTranslator(ports: EventTranslatorPorts) {
       rel?.rel_type === "m.thread" && typeof rel.event_id === "string"
         ? rel.event_id
         : undefined;
+    // fork: 原生 mention(MSC3952)。单桥接账号下 user_ids 只会指向本 bot,
+    // 用来确认"确实 @ 了机器人";@<agent 名> 的路由另按文本解析。
+    const rawMentions = event.content?.["m.mentions"]?.user_ids;
+    const mentions = Array.isArray(rawMentions)
+      ? rawMentions.filter((m: unknown): m is string => typeof m === "string")
+      : undefined;
     return {
       chatId: roomId,
       transport: transportType,
@@ -67,6 +73,7 @@ export function createEventTranslator(ports: EventTranslatorPorts) {
       isGroupChat,
       wasMentioned: false,
       ...(threadRoot && { threadRoot }),
+      ...(mentions && mentions.length > 0 && { mentions }),
     };
   }
 

@@ -10,6 +10,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import * as path from "node:path";
 import type { RpcClient, RpcEventListener } from "@earendil-works/pi-coding-agent";
 import { type ConfigStore, projectFallbackChain } from "../config.js";
@@ -53,6 +54,17 @@ export interface ProjectManagerOptions {
     sessionBase: string;
     idleMinutes: number;
   };
+  /**
+   * Agent 车道(fork):提供即启用 —— 群里 @<agent 名> 的会话走专属子进程。
+   * cwd 优先用 expertsRoot/<name>(其 AGENTS.md 自动成为身份章程),否则用
+   * fallbackCwd;每个 (线程 × Agent) 一条独立 --session-dir。缺省 = 不启用。
+   */
+  agentLaneOptions?: {
+    fallbackCwd: string;
+    sessionBase: string;
+    expertsRoot: string;
+    idleMinutes: number;
+  };
 }
 
 /** 项目会话目录名(单一持有:pmctl 展示与 i18n 文案从这里取 —— 审计工程批 票19)。 */
@@ -76,6 +88,17 @@ export class ProjectManager {
   private threadLastUsed = new Map<string, number>();
   /** fork: 空闲回收定时器(stopAll 清理)。 */
   private threadReaper?: NodeJS.Timeout;
+  /** fork: Agent 车道选项(undefined = 未启用)。 */
+  private agentLaneOpts?: {
+    fallbackCwd: string;
+    sessionBase: string;
+    expertsRoot: string;
+    idleMinutes: number;
+  };
+  /** fork: agentLaneKey -> PiRpc(懒起)。 */
+  private agentLaneRpcs = new Map<string, PiRpc>();
+  /** fork: agentLaneKey -> 最近活跃时间戳。 */
+  private agentLaneLastUsed = new Map<string, number>();
 
   constructor(opts: ProjectManagerOptions) {
     this.defaultRpc = opts.defaultRpc;
@@ -87,7 +110,13 @@ export class ProjectManager {
     this.notifyRoom = opts.notifyRoom ?? (() => {});
     if (opts.threadOptions) {
       this.threadOpts = opts.threadOptions;
-      this.threadReaper = setInterval(() => void this.reapIdleThreads(), 60_000);
+    }
+    if (opts.agentLaneOptions) {
+      this.agentLaneOpts = opts.agentLaneOptions;
+    }
+    if (this.threadOpts || this.agentLaneOpts) {
+      // 线程车道与 Agent 车道共用一台回收器:同一条时间轴、同一套语义。
+      this.threadReaper = setInterval(() => void this.reapIdleLanes(), 60_000);
       this.threadReaper.unref?.();
     }
   }
@@ -158,18 +187,76 @@ export class ProjectManager {
     return rpc;
   }
 
+  /**
+   * Agent 车道的 PiRpc(懒起)。laneKey 由调用方用 agentLaneKey() 生成,
+   * 已含 (房间 × 线程根 × Agent)。启动参数取该 Agent 定义:系统提示词、
+   * 模型、思考强度、工具白名单;cwd 优先专家目录(其 AGENTS.md 自动加载)。
+   */
+  async getAgentLaneRpc(
+    laneKey: string,
+    spec: { name: string; systemPrompt: string; model?: string; thinking?: string; tools?: string }
+  ): Promise<PiRpc> {
+    if (!this.agentLaneOpts) throw new Error("agent lanes not enabled");
+    this.agentLaneLastUsed.set(laneKey, Date.now());
+
+    const existing = this.agentLaneRpcs.get(laneKey);
+    if (existing) {
+      await existing.start().catch((err: unknown) => {
+        logger.withLabel(existing.label).warn(`⚠️ Agent 车道连接失败(沿用现有实例继续): ${errorMessage(err)}`);
+      });
+      return existing;
+    }
+
+    const { fallbackCwd, sessionBase, expertsRoot } = this.agentLaneOpts;
+    const expertDir = path.join(expertsRoot, spec.name);
+    const cwd = existsSync(expertDir) ? expertDir : fallbackCwd;
+    const sessionDir = path.join(sessionBase, "agents", this.threadDirName(spec.name), this.threadDirName(laneKey));
+    const args = [...(this.baseOptions.args ?? []), "--session-dir", sessionDir, "--append-system-prompt", spec.systemPrompt];
+    if (spec.model) args.push("--model", spec.model);
+    if (spec.thinking) args.push("--thinking", spec.thinking);
+    if (spec.tools) args.push("--tools", spec.tools);
+
+    const label = `agent/${spec.name}`;
+    const rpc = this.newRpc({ ...this.baseOptions, cwd, args, label });
+    rpc.onEvent((event) => {
+      this.onRoomEvent(laneKey, event, rpc);
+    });
+
+    this.agentLaneRpcs.set(laneKey, rpc);
+    logger.withLabel(label).info(`👤 Agent 车道启动: ${spec.name} (cwd ${cwd})`);
+    await rpc.start();
+    return rpc;
+  }
+
+  /** 某条 Agent 车道当前是否在跑。 */
+  hasAgentLane(laneKey: string): boolean {
+    return this.agentLaneRpcs.has(laneKey);
+  }
+
   /** 空闲回收:超时车道停进程、清记账;会话文件留在盘上,复活即续。 */
-  private async reapIdleThreads(): Promise<void> {
-    if (!this.threadOpts) return;
-    const idleMs = this.threadOpts.idleMinutes * 60_000;
+  private async reapIdleLanes(): Promise<void> {
     const now = Date.now();
-    for (const [key, rpc] of this.threadRpcs) {
-      const last = this.threadLastUsed.get(key) ?? now;
-      if (now - last < idleMs) continue;
-      logger.withLabel(rpc.label).info(`🧵 线程车道空闲回收(会话已保留)`);
-      this.threadRpcs.delete(key);
-      this.threadLastUsed.delete(key);
-      await this.stopWithWarn(rpc);
+    if (this.threadOpts) {
+      const idleMs = this.threadOpts.idleMinutes * 60_000;
+      for (const [key, rpc] of this.threadRpcs) {
+        const last = this.threadLastUsed.get(key) ?? now;
+        if (now - last < idleMs) continue;
+        logger.withLabel(rpc.label).info(`🧵 线程车道空闲回收(会话已保留)`);
+        this.threadRpcs.delete(key);
+        this.threadLastUsed.delete(key);
+        await this.stopWithWarn(rpc);
+      }
+    }
+    if (this.agentLaneOpts) {
+      const idleMs = this.agentLaneOpts.idleMinutes * 60_000;
+      for (const [key, rpc] of this.agentLaneRpcs) {
+        const last = this.agentLaneLastUsed.get(key) ?? now;
+        if (now - last < idleMs) continue;
+        logger.withLabel(rpc.label).info(`👤 Agent 车道空闲回收(会话已保留)`);
+        this.agentLaneRpcs.delete(key);
+        this.agentLaneLastUsed.delete(key);
+        await this.stopWithWarn(rpc);
+      }
     }
   }
 
@@ -208,7 +295,7 @@ export class ProjectManager {
    *  ones so pi subprocesses re-read the credential file). Not-yet-started
    *  projects are absent by design — their first start reads the fresh file. */
   allRpcs(): PiRpc[] {
-    return [this.defaultRpc, ...this.projectRpcs.values(), ...this.threadRpcs.values()];
+    return [this.defaultRpc, ...this.projectRpcs.values(), ...this.threadRpcs.values(), ...this.agentLaneRpcs.values()];
   }
 
   /** Reverse lookup: the project room that owns this rpc (undefined = shared
@@ -376,12 +463,17 @@ export class ProjectManager {
       await this.stopWithWarn(rpc);
     }
     this.projectRpcs.clear();
-    // fork: 线程车道一并回收,定时器停转。
+    // fork: 线程车道与 Agent 车道一并回收,定时器停转。
     for (const rpc of this.threadRpcs.values()) {
       await this.stopWithWarn(rpc);
     }
     this.threadRpcs.clear();
     this.threadLastUsed.clear();
+    for (const rpc of this.agentLaneRpcs.values()) {
+      await this.stopWithWarn(rpc);
+    }
+    this.agentLaneRpcs.clear();
+    this.agentLaneLastUsed.clear();
     if (this.threadReaper) {
       clearInterval(this.threadReaper);
       this.threadReaper = undefined;

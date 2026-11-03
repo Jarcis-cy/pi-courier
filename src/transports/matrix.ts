@@ -49,6 +49,11 @@ export class MatrixProvider {
   /** Event translator (spec #72 票2/C2) — assembled once botUserId is known. */
   private translator?: ReturnType<typeof createEventTranslator>;
 
+  /** 本 bot 的 MXID(连接后才有;fork 的 @-解析用它排除"@了自己")。 */
+  get userId(): string | undefined {
+    return this.botUserId;
+  }
+
   /** Room-capability half of the Matrix integration (see matrix-rooms.ts). */
   readonly roomOps = new MatrixRoomOps({
     getClient: () => this.client,

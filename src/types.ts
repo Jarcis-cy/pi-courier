@@ -58,6 +58,9 @@ export interface ExternalMessage {
    * messageId)作为车道键 —— 每根线程一个独立 pi 会话,回复也发回线程。
    */
   threadRoot?: string;
+  /** 原生 mention(fork):Matrix `m.mentions.user_ids` 里的 MXID。
+   *  单桥接账号下指向本 bot = "确实 @ 了机器人";Agent 目标仍按文本解析。 */
+  mentions?: string[];
   /** 载荷(spec #72 票1/C3):文本、附件、附件失败或不支持类型,四选一 */
   payload: MessagePayload;
 }
@@ -136,6 +139,22 @@ export interface MsgBridgeConfig {
   threadSessions?: boolean;
   /** 线程车道空闲回收阈值(分钟,默认 30;会话文件保留,复活即续)。 */
   threadIdleMinutes?: number;
+  /**
+   * Agent 成员与 @-路由(fork):true 时群里 @<agent 名> 的 message 分发进
+   * 该 Agent 的专属车道(线程 × Agent),回复以 `[agent]` 前缀标注。
+   * 无 @ 的消息行为不变。缺省 false = 与上游逐字节一致。
+   */
+  agentLanes?: boolean;
+  /** Agent 定义目录列表(默认 `~/.pi/agent/agents`;`~` 会展开)。 */
+  agentDirs?: string[];
+  /** Agent 互 @ 的连续跳数上限(默认 6)。 */
+  maxAgentHops?: number;
+  /** 互 @ 计数的静默重置窗口(分钟,默认 10)。 */
+  agentHopResetMinutes?: number;
+  /** 派发给 Agent 时注入的本线程历史条数(默认 30;0 关闭)。 */
+  agentHistoryLimit?: number;
+  /** Agent 车道空闲回收阈值(分钟,默认 30)。 */
+  agentLaneIdleMinutes?: number;
   /** 显式指定 pi 的 cli.js 路径(默认:PI_CLI_PATH → which pi → 本地 node_modules) */
   cliPath?: string;
   /** 日志级别:debug | info | warn | error(默认 info;`pi-courier logs --level debug` 可查看全量) */
@@ -367,6 +386,8 @@ export interface ReplyTarget {
   username: string;
   /** 线程根(fork):存在时该回合的回复都发进这条线程。 */
   threadRoot?: string;
+  /** Agent 车道(fork):存在时回复加 `[agent]` 前缀,且不再做活卡聚合。 */
+  agentName?: string;
 }
 
 /**

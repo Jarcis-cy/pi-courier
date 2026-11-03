@@ -416,6 +416,9 @@ const en: Record<MessageKey, string> = {
   "router.bang.inProgress": "⏳ Running: {command}{suffix} — the result will follow as a reply; /bashstop can abort it.",
   "router.prompt.failed": "❌ Could not send to pi: {message}",
   "router.rpc.startFailed": "❌ Could not start the pi process: {message}",
+  "router.agent.hopLimit": "⚠️ Agents have @-ed each other {max} hops in a row; automatic forwarding stopped. @ the target agent directly to continue.",
+  "router.agent.startFailed": "❌ Could not start the lane for agent \"{agent}\": {message}",
+  "router.agent.unknown": "⚠️ No agent definition named \"{agent}\" was found.",
   "router.retry.inProgress": "⚠️ Call failed, retrying {attempt}/{max}: {error}",
   "router.retry.exhausted": "❌ Auto-retry exhausted: {error}",
   "router.fallback.switched":

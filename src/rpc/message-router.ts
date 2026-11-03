@@ -37,6 +37,16 @@ import type { UpdateOrchestrator } from "../update/updater.js";
 import { parseWorkflowProgress } from "../workflow/adapter.js";
 import { renderWorkflowProgress, workflowCardLabels } from "../workflow/render.js";
 import { isTerminal, type WorkflowProgressIR, type WorkflowRunStatus } from "../workflow/types.js";
+import {
+  type AgentSpec,
+  agentLaneKey,
+  HopGuard,
+  labelAgentReply,
+  parseAgentMentions,
+  renderHistoryWindow,
+  stripAgentLabel,
+  ThreadHistory,
+} from "./agent-lanes.js";
 import type { PersistedAttachmentEntry } from "./attachment-ledger.js";
 import { AttachmentLedger } from "./attachment-ledger.js";
 import { BacklogInbox } from "./backlog-inbox.js";
@@ -136,6 +146,19 @@ export interface MessageRouterDeps {
    *  依赖面取最小结构(路由侧只调 handleCommand);Absent = /update 回
    *  unavailable 文案(命令层已处理),行为与未接线一致。 */
   updater?: Pick<UpdateOrchestrator, "handleCommand">;
+  /**
+   * fork: Agent 成员与 @-路由。提供即启用(装配根按 config.agentLanes 决定)。
+   * roster 是启动时扫出来的名单;history/hops 是进程内状态(不落盘)。
+   */
+  agentLanes?: {
+    roster: Map<string, AgentSpec>;
+    history: ThreadHistory;
+    hops: HopGuard;
+    /** 连接后才拿到,故为取值函数。 */
+    botUserId: () => string;
+    historyLimit: number;
+    maxHops: number;
+  };
 }
 
 /**
@@ -322,10 +345,15 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
   // 目标参数原样穿透,签名与底层缝一致;未注入的可选缝安全降级。
   // 展开式传参:threadRoot 缺省时不追加第 4 参 —— 无线程路径的出站
   // 调用形态与上游逐字节一致(测试与任何按参断言的下游都不受扰)。
-  const sendReplyT = (target: ReplyTarget, text: string): Promise<void> =>
-    target.threadRoot
-      ? sendReply(target.chatId, target.transport, text, target.threadRoot)
-      : sendReply(target.chatId, target.transport, text);
+  // Agent 车道的回复统一带 `[agent]` 前缀 —— 单桥接账号下这是唯一的身份标记。
+  const withAgentLabel = (target: ReplyTarget, text: string): string =>
+    target.agentName ? labelAgentReply(target.agentName, text) : text;
+  const sendReplyT = (target: ReplyTarget, text: string): Promise<void> => {
+    const body = withAgentLabel(target, text);
+    return target.threadRoot
+      ? sendReply(target.chatId, target.transport, body, target.threadRoot)
+      : sendReply(target.chatId, target.transport, body);
+  };
   const sendLiveCardT = (target: ReplyTarget, text: string): Promise<string | undefined> =>
     deps.sendLiveCard
       ? target.threadRoot
@@ -339,6 +367,105 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
         : deps.editReply(target.chatId, target.transport, messageId, text)
       : Promise.resolve();
   const bindings = new WeakMap<PiRpc, RoomBinding>();
+  // ── fork: Agent 车道 ─────────────────────────────────────────────────
+  // 线程历史键 = 房间 + 车道根(与车道键同源,只是不带 Agent 名)。
+  const threadKeyOf = (roomId: string, laneRoot: string): string => `${roomId}\u0000${laneRoot}`;
+
+  /** 把本线程最近窗口拼到一条待派发文本前(窗口不含这条消息本身)。 */
+  const composeForAgent = (roomId: string, laneRoot: string, text: string): string => {
+    const lane = deps.agentLanes;
+    if (!lane || lane.historyLimit <= 0) return text;
+    const hist = renderHistoryWindow(lane.history.window(threadKeyOf(roomId, laneRoot), lane.historyLimit));
+    return hist ? `${hist}\n\n${text}` : text;
+  };
+
+  /**
+   * 把一条已拼好上下文的文本投进某个 Agent 的车道。
+   *
+   * **永不 reject**：调用方既有 `await Promise.all(...)` 也有 fire-and-forget
+   * 的 `void`（互 @ 路由），若这里抛出而回执的 sendReply 又失败（Matrix 抖动），
+   * 就会变成 unhandled rejection。所以连"出错回执"本身也吞掉 —— 失败已经进
+   * 日志，不需要再惊动进程。
+   */
+  const dispatchAgentTurn = async (opts: {
+    agent: string;
+    body: string;
+    roomId: string;
+    transport: string;
+    username: string;
+    laneRoot: string;
+  }): Promise<void> => {
+    const lane = deps.agentLanes;
+    if (!lane) return;
+    const notify = (text: string): Promise<void> =>
+      sendReply(opts.roomId, opts.transport, text, opts.laneRoot).catch(() => {});
+    const spec = lane.roster.get(opts.agent);
+    if (!spec) {
+      await notify(t("router.agent.unknown", { agent: opts.agent }));
+      return;
+    }
+    try {
+      const rpc = await projectManager.getAgentLaneRpc(
+        agentLaneKey(opts.roomId, opts.laneRoot, opts.agent),
+        spec
+      );
+      // Agent 车道一律 pin:同一进程只服务 (线程 × Agent),不会被别的牌子改写。
+      bindReplyTarget(
+        rpc,
+        {
+          chatId: opts.roomId,
+          transport: opts.transport,
+          username: opts.username,
+          threadRoot: opts.laneRoot,
+          agentName: opts.agent,
+        },
+        true
+      );
+      await rpc.prompt(opts.body);
+    } catch (err) {
+      logger.withLabel(`agent/${opts.agent}`).warn(`⚠️ Agent 车道派发失败: ${errorMessage(err)}`);
+      await notify(t("router.agent.startFailed", { agent: opts.agent, message: errorMessage(err) }));
+    }
+  };
+
+  /**
+   * Agent 回复里 @ 了别的 Agent → 继续投递(带防环)。
+   * 护栏按线程计连续跳数:用户发言清零;超过上限就停并在群里提示。
+   */
+  const routeAgentMentions = (target: ReplyTarget, replyText: string): void => {
+    const lane = deps.agentLanes;
+    if (!lane || !target.agentName || !target.threadRoot) return;
+    const clean = stripAgentLabel(target.agentName, replyText);
+    const names = parseAgentMentions(clean, new Set(lane.roster.keys()), lane.botUserId()).filter(
+      (n) => n !== target.agentName
+    );
+    if (names.length === 0) return;
+
+    const key = threadKeyOf(target.chatId, target.threadRoot);
+    const decision = lane.hops.tryHop(key);
+    if (!decision.allowed) {
+      // 提示本身不带 Agent 前缀 —— 它是系统对用户说的话。
+      void sendReply(
+        target.chatId,
+        target.transport,
+        t("router.agent.hopLimit", { max: String(lane.maxHops) }),
+        target.threadRoot
+      ).catch(() => {});
+      return;
+    }
+    const body = composeForAgent(target.chatId, target.threadRoot, clean);
+    for (const agent of names) {
+      void dispatchAgentTurn({
+        agent,
+        body,
+        roomId: target.chatId,
+        transport: target.transport,
+        username: target.username,
+        laneRoot: target.threadRoot,
+      }).catch(() => {});
+    }
+  };
+
   const bindReplyTarget = (rpc: PiRpc, replyTarget: ReplyTarget, pinned: boolean): void => {
     bindings.set(rpc, { pinned, replyTarget });
   };
@@ -1459,6 +1586,49 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
       },
     },
     {
+      name: "agentLanes",
+      preAuth: false,
+      consumesLedger: false,
+      needsRpc: false,
+      // fork: 群消息里 @<agent 名> → 分发进各自的 Agent 车道(线程 × Agent)。
+      // 没有 @ 目标就返回 false,落到下面的 prompt stage —— 原有语义不变。
+      // 斜杠命令仍由更前面的 command stage 处理,这里的 @ 只在普通消息上生效。
+      handle: async (ctx) => {
+        const lane = deps.agentLanes;
+        if (!lane) return false;
+        if (ctx.text.startsWith("/")) return false;
+        const targets = parseAgentMentions(ctx.text, new Set(lane.roster.keys()), lane.botUserId());
+        if (targets.length === 0) return false;
+
+        // 车道根:线程内消息用线程根;时间线消息以自身为根(自动开一条线程)。
+        const laneRoot = ctx.msg.threadRoot ?? ctx.msg.messageId;
+        const key = threadKeyOf(ctx.msg.chatId, laneRoot);
+
+        // 用户发言 = 人工介入:互 @ 计数清零。
+        lane.hops.noteUserTurn(key);
+
+        // 先按"当前消息之前"的历史拼上下文,再把当前消息记进历史。
+        // (顺序反了会把这条消息在 prompt 里说两遍)
+        const body = composeForAgent(ctx.msg.chatId, laneRoot, ctx.text);
+        lane.history.record(key, { who: `@${ctx.msg.username}`, text: ctx.text, at: Date.now() });
+
+        // 多目标并行分发:每条车道独立进程 + 独立会话,互不阻塞。
+        await Promise.all(
+          targets.map((agent) =>
+            dispatchAgentTurn({
+              agent,
+              body,
+              roomId: ctx.msg.chatId,
+              transport: ctx.msg.transport,
+              username: ctx.msg.username,
+              laneRoot,
+            })
+          )
+        );
+        return true;
+      },
+    },
+    {
       name: "prompt",
       preAuth: false,
       consumesLedger: true,
@@ -1678,6 +1848,18 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
         const replyPreview = turn.fullText ?? "";
         log.info(`[agent] reply to @${target.username}: ${replyPreview.slice(0, 500)}${replyPreview.length > 500 ? "…" : ""}`);
 
+        // fork: Agent 车道的回复进线程历史,并接着处理它对其他 Agent 的 @。
+        // 放在派发之前:即使下面提前 return(捕获/分片),记忆与转发都已发生。
+        if (target.agentName && deps.agentLanes && turn.fullText) {
+          const key = threadKeyOf(target.chatId, target.threadRoot ?? "");
+          deps.agentLanes.history.record(key, {
+            who: `[${target.agentName}]`,
+            text: turn.fullText,
+            at: Date.now(),
+          });
+          routeAgentMentions(target, turn.fullText);
+        }
+
         if (turn.fullText === null) {
           // No content this turn — keep the binding for a follow-up turn
           return;
@@ -1692,7 +1874,7 @@ export function createMessageRouter(deps: MessageRouterDeps): MessageRouter {
         // 且本步骤与前序步骤经出站链串行,顺序由架构保证而非时序运气。
         // 报错回合绕过聚合:失败行醒目直达,不埋进持续刷新的卡。
         // hideToolCalls、配置关、编辑缝未注入都落到下方现行派发路径。
-        if (turn.pendingTools && liveCardAggregation() && !isErrorTurn) {
+        if (turn.pendingTools && liveCardAggregation() && !isErrorTurn && !target.agentName) {
           const narration: string | null = turn.text;
           const toolLines: string = turn.toolsText!; // pendingTools+未隐藏 ⇒ 非空
           enqueueLiveCardTurn(rpc, async () => {

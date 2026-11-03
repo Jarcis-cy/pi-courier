@@ -11,6 +11,7 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { AUDIT_EVENTS, AuditLog } from "./audit/audit-log.js";
@@ -47,6 +48,7 @@ import { Heartbeat } from "./resilience/heartbeat.js";
 import { clearManualStop, manualStopMarkerPath, markManualStop } from "./resilience/manual-stop.js";
 import { ResourceGuard } from "./resilience/resource-guard.js";
 import { WriteFailureRecorder } from "./resilience/write-failure.js";
+import { HopGuard, scanAgentRoster, ThreadHistory } from "./rpc/agent-lanes.js";
 import type { PersistedAttachmentEntry } from "./rpc/attachment-ledger.js";
 import { createMcpOrchestration } from "./rpc/command-map.js";
 import { createMessageRouter } from "./rpc/message-router.js";
@@ -346,6 +348,34 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   // Declared before sendReply below: outbound 📤 lines resolve their label
   // through labelForRoom (spec #34) — ordering kept explicit so the closure
   // does not rely on hoisting.
+  // fork: Agent 成员与 @-路由(config.agentLanes)。名单在启动时扫一次 ——
+  // 新增定义要重启服务才生效(与项目映射同款语义,写进文档)。
+  const agentLaneCfg = config.agentLanes === true
+    ? (() => {
+        const expand = (d: string): string =>
+          d.startsWith("~/") ? path.join(os.homedir(), d.slice(2)) : d;
+        const agentDir = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
+        const dirs = (config.agentDirs?.length
+          ? config.agentDirs
+          : [path.join(agentDir, "agents"), path.join(os.homedir(), ".pi", "agent", "agents")]
+        ).map(expand);
+        const roster = scanAgentRoster(dirs);
+        const historyLimit = config.agentHistoryLimit ?? 30;
+        const maxHops = config.maxAgentHops ?? 6;
+        logger.info(`👤 Agent 车道已启用:${roster.size} 个定义(${dirs.join(", ")})`);
+        return {
+          roster,
+          dirs,
+          history: new ThreadHistory(Math.max(60, historyLimit * 2)),
+          hops: new HopGuard(maxHops, config.agentHopResetMinutes ?? 10),
+          botUserId: () => matrix?.userId ?? "",
+          historyLimit,
+          maxHops,
+          idleMinutes: config.agentLaneIdleMinutes && config.agentLaneIdleMinutes > 0 ? config.agentLaneIdleMinutes : 30,
+        };
+      })()
+    : undefined;
+
   const projectManager = new ProjectManager({
     defaultRpc: rpc,
     baseOptions: {
@@ -370,6 +400,22 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
               ? path.join(sessionDir, "threads")
               : path.join(workdir, ".pi-threads"),
             idleMinutes: config.threadIdleMinutes && config.threadIdleMinutes > 0 ? config.threadIdleMinutes : 30,
+          },
+        }
+      : {}),
+    // fork: Agent 车道 —— cwd 优先 <expertsRoot>/<name>,否则回落默认 workdir。
+    ...(agentLaneCfg
+      ? {
+          agentLaneOptions: {
+            fallbackCwd: workdir,
+            sessionBase: sessionDir
+              ? path.join(sessionDir, "agent-lanes")
+              : path.join(workdir, ".pi-agent-lanes"),
+            expertsRoot: path.join(
+              process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent"),
+              "experts"
+            ),
+            idleMinutes: agentLaneCfg.idleMinutes,
           },
         }
       : {}),
@@ -627,6 +673,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         }
       : {}),
     managementRoomAdoptionAllowed: () => startup.managementRoomAdoptionAllowed(),
+    // fork: @-路由的名单与进程内状态(历史窗口、互 @ 计数)。
+    ...(agentLaneCfg ? { agentLanes: agentLaneCfg } : {}),
     attachmentsLedger,
     reminders: reminderClock,
     queueSnapshots,
