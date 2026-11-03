@@ -80,7 +80,10 @@ export class MatrixProvider {
     /** fork: 线程会话。开启时,本账号**参与过**的线程内消息免 @;
      *  没参与过的线程(别人的串)仍然要 @ 才进 —— 否则群里任何线程都会
      *  把本账号唤醒,变成到处插嘴。 */
-    private threadSessions?: boolean
+    private threadSessions?: boolean,
+    /** fork: 信任用户判断。线程免 @ 只对信任用户生效,否则两个 Agent 会
+     *  在同一个串里互相唤醒成死循环。 */
+    private isTrustedSender?: (userId: string) => boolean
   ) {}
 
   /**
@@ -138,7 +141,12 @@ export class MatrixProvider {
       resolveIsGroupChat: (roomId) => this.resolveIsGroupChat(roomId),
       ...(this.attachments ? { attachments: this.attachments } : {}),
       ...(this.isAgentMention ? { isAgentMention: this.isAgentMention } : {}),
-      ...(this.threadSessions ? { isThreadFree: (root: string) => this.ownThreads.has(root) } : {}),
+      ...(this.threadSessions
+        ? {
+            isThreadFree: (root: string) => this.ownThreads.has(root),
+            ...(this.isTrustedSender ? { isTrustedSender: this.isTrustedSender } : {}),
+          }
+        : {}),
     });
 
     // Track room membership and member counts

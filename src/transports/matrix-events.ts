@@ -41,6 +41,9 @@ export interface EventTranslatorPorts {
    *  进了讨论串就是在跟这个 Agent 说话,不该每条都 @ 一次。
    *  缺省 = 关闭(仍要求 @)。 */
   isThreadFree?: (threadRoot: string) => boolean;
+  /** 发送者是否是信任用户。线程免 @ 只对信任用户生效 —— 否则两个 Agent
+   *  在同一个串里会互相唤醒,形成每几秒一轮的死循环。 */
+  isTrustedSender?: (userId: string) => boolean;
 }
 
 export interface TranslatedEvent {
@@ -53,7 +56,7 @@ export interface TranslatedEvent {
 }
 
 export function createEventTranslator(ports: EventTranslatorPorts) {
-  const { transportType, botUserId, quoteCache, resolveIsGroupChat, attachments, isAgentMention, isThreadFree } = ports;
+  const { transportType, botUserId, quoteCache, resolveIsGroupChat, attachments, isAgentMention, isThreadFree, isTrustedSender } = ports;
 
   /** The common ExternalMessage envelope fields (no mention stripping on
    *  non-text payloads — filenames cannot carry a meaningful mention). */
@@ -116,7 +119,10 @@ export function createEventTranslator(ports: EventTranslatorPorts) {
       relForThread?.rel_type === "m.thread" && typeof relForThread.event_id === "string"
         ? relForThread.event_id
         : undefined;
-    const threadFree = isGroupChat && threadRootForFree && isThreadFree ? isThreadFree(threadRootForFree) : false;
+    const threadFree =
+      Boolean(isGroupChat && threadRootForFree && isThreadFree) &&
+      (isTrustedSender ? isTrustedSender(event.sender) : false) &&
+      Boolean(threadRootForFree && isThreadFree?.(threadRootForFree));
     const wasMentioned = isGroupChat
       ? wasBotMentioned(messageText, botUserId) || Boolean(isAgentMention?.(messageText)) || threadFree
       : false;

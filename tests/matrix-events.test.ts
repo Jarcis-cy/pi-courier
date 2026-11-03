@@ -313,6 +313,7 @@ describe("fork: MSC3440 线程根解析(threadSessions 的入站半边)", () => 
       quoteCache: createQuoteCache(),
       resolveIsGroupChat: async () => true,
       isThreadFree: () => true,
+      isTrustedSender: () => true,
     });
     const inThread = textEvent("悄悄说一句", {
       "m.relates_to": { rel_type: "m.thread", event_id: "$root1" },

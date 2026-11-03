@@ -279,7 +279,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       undefined,
       (text) => isAgentMention?.(text) ?? false,
       // 线程会话:只有本账号参与过的线程免 @(归属判断在 provider 内部)。
-      config.threadSessions === true
+      config.threadSessions === true,
+      // 且只对信任用户生效 —— Agent 之间的消息永远要 @ 才进,否则两个
+      // Agent 在同一个串里会互相唤醒成死循环。
+      (userId: string) => auth.isTrustedUser(userId, "matrix")
     );
     // Attachment intake (issue #66): the store needs the Matrix client for
     // downloads, so it is created here and handed to the provider. Both read
