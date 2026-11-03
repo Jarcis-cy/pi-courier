@@ -96,6 +96,8 @@ export interface MsgBridgeConfig {
     guestUsers?: string[];
     adminUserId?: string;
     channels?: Record<string, { enabled: boolean; mode: "all" | "mentions" | "trusted-only" }>;
+    /** fork: 只处理信任用户(见 MsgBridgeConfig.trustedOnly)。 */
+    trustedOnly?: boolean;
   };
   hideToolCalls?: boolean;
   /**
@@ -155,6 +157,12 @@ export interface MsgBridgeConfig {
   agentHistoryLimit?: number;
   /** Agent 车道空闲回收阈值(分钟,默认 30)。 */
   agentLaneIdleMinutes?: number;
+  /**
+   * 只处理信任用户的消息(默认 false)。团队 Agent 常被其他 Agent @ 到
+   * (比如管家介绍新成员时),那不是派活 —— 开启后,非信任发送者(含其他
+   * Agent 账号)的消息在授权门就被丢弃,连 @ 也不触发。
+   */
+  trustedOnly?: boolean;
   /**
    * 扩展通知进房间的最低级别(默认 "warning")。设成 "info" 时,扩展用
    * notify(info) 给出的普通提示也会发到房间 —— 适配那些"命令输出只走

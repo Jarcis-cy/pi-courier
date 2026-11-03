@@ -49,6 +49,8 @@ export class ChallengeAuth {
   private trustedUsers = new Set<string>();
   private guestUsers = new Set<string>();
   private channelAuth = new Map<string, ChannelAuth>();
+  /** fork: 只处理信任用户(见 MsgBridgeConfig.trustedOnly)。 */
+  private trustedOnly = false;
   private blockedUsers = new Map<string, number>(); // userId -> unblock timestamp
   /** 错房配对提示的每(用户,对话)冷却(60s),防数字消息刷屏(spec #93 票3)。 */
   private pairingHintCooldowns = new Map<string, number>();
@@ -67,7 +69,11 @@ export class ChallengeAuth {
     guestUsers?: string[];
     adminUserId?: string;
     channels?: Record<string, { enabled: boolean; mode: "all" | "mentions" | "trusted-only" }>;
+    trustedOnly?: boolean;
   }): void {
+    if (config.trustedOnly !== undefined) {
+      this.trustedOnly = config.trustedOnly === true;
+    }
     if (config.trustedUsers) {
       this.trustedUsers = new Set(config.trustedUsers);
     }
@@ -141,6 +147,12 @@ export class ChallengeAuth {
       }
 
       return await this.initiateChallenge(namespacedUserId, chatId, username, sendMessage);
+    }
+
+    // fork: trustedOnly —— 只认信任用户。团队 Agent 会被别的 Agent @ 到
+    // (管家介绍新成员就是典型),那不是派活;开启后这类消息在这里就被丢弃。
+    if (this.trustedOnly && !this.trustedUsers.has(namespacedUserId)) {
+      return false;
     }
 
     // Group chat: check channel authorization
